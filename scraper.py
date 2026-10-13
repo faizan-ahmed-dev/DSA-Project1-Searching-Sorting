@@ -12,7 +12,7 @@ import time
 import requests
 from PyQt5.QtCore import QThread, pyqtSignal
 
-from storage import MovieStore
+from storage import DEFAULT_DB, MovieStore
 
 BASE_URL = "https://api.themoviedb.org/3"
 START_YEAR, END_YEAR = 1980, 2025
@@ -26,7 +26,7 @@ class ScraperWorker(QThread):
     status = pyqtSignal(str)          # text for the log / status label
     finished_signal = pyqtSignal(str) # "done", "stopped" or "error"
 
-    def __init__(self, api_key, target=16000, db_path="movies.db"):
+    def __init__(self, api_key, target=16000, db_path=DEFAULT_DB):
         super().__init__()
         self.api_key = api_key.strip()
         self.target = target

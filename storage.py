@@ -1,6 +1,10 @@
 """storage.py - saves scraped movies to SQLite so progress is never lost."""
 import csv
+import os
 import sqlite3
+
+# movies.db always lives next to these .py files, wherever you launch the app from
+DEFAULT_DB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "movies.db")
 
 # (column name, SQL type). 13 attributes, you need at least 8.
 COLUMNS = [
@@ -24,7 +28,7 @@ FIELDS = [name for name, _ in COLUMNS]
 class MovieStore:
     # NOTE: SQLite connections must stay in the thread that created them,
     # so the scraper thread and the UI thread each create their own MovieStore.
-    def __init__(self, path="movies.db"):
+    def __init__(self, path=DEFAULT_DB):
         self.conn = sqlite3.connect(path)
         cols = ", ".join(f"{n} {t}" for n, t in COLUMNS)
         self.conn.execute(f"CREATE TABLE IF NOT EXISTS movies ({cols})")
