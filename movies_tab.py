@@ -20,6 +20,8 @@ filter_ids  : None (no filter) or the set of movie ids that passed the last sear
 Sort scope (next to the row count) decides whether a sort works on all_records or only
 on the filtered rows.
 """
+import random
+
 from PyQt5.QtCore import QAbstractTableModel, QModelIndex, Qt, QThread, pyqtSignal
 from PyQt5.QtWidgets import (QAbstractItemView, QComboBox, QGridLayout, QGroupBox, QHBoxLayout,
                              QLabel, QLineEdit, QMessageBox, QProgressBar, QPushButton,
@@ -133,6 +135,8 @@ class MoviesTab(QWidget):
         self._busy = False
         self._pending = None
         self.last_sorted = None    # (column key, descending) of the last finished sort
+        self.sample_size = None    # set while the table shows a sorted random sample
+        self.full_order = None     # (column, descending) the FULL dataset is currently sorted by
 
         # ================= tool tab 1: single-column sort =================
         self.column_combo = QComboBox()
@@ -269,14 +273,33 @@ class MoviesTab(QWidget):
         self.hint_label = QLabel()
         self.hint_label.setStyleSheet("color: #b04000;")
         self.scope_combo = QComboBox()
-        self.scope_combo.addItems(["Full dataset", "Filtered results"])
-        self.scope_combo.setToolTip("Which rows the sort buttons and the Benchmark work on")
+        self.scope_combo.addItems(["Sort everything", "Sort only filtered rows"])
+        self.scope_combo.setToolTip(
+            "Only matters while a search or filter is active.\n"
+            "Sort everything: all rows are sorted (the filter stays applied).\n"
+            "Sort only filtered rows: just the rows currently shown are sorted.\n"
+            "Greyed out while nothing is filtered, because both would mean 'all rows'.")
+        self.scope_combo.setEnabled(False)
+        self.rows_combo = QComboBox()
+        self.rows_combo.setEditable(True)
+        self.rows_combo.setInsertPolicy(QComboBox.NoInsert)
+        self.rows_combo.addItems(["All rows", "100", "500", "1,000", "2,000", "5,000", "10,000"])
+        self.rows_combo.setFixedWidth(110)
+        self.rows_combo.setToolTip(
+            "How many rows the Sort and Multi-level sort buttons use. Pick a size or type any number.\n"
+            "If it is smaller than the scope, a random sample is sorted and shown (fixed seed, so it is "
+            "repeatable).\nClick 'Show all rows' to go back. (The Benchmark has its own size choice.)")
+        self.show_all_btn = QPushButton("Show all rows")
+        self.show_all_btn.setEnabled(False)
         self.reload_btn = QPushButton("Reload data")
         status = QHBoxLayout()
         status.addWidget(self.count_label)
         status.addWidget(self.hint_label, 1)
         status.addWidget(QLabel("Sort scope:"))
         status.addWidget(self.scope_combo)
+        status.addWidget(QLabel("Rows:"))
+        status.addWidget(self.rows_combo)
+        status.addWidget(self.show_all_btn)
         status.addWidget(self.reload_btn)
 
         layout = QVBoxLayout(self)
@@ -290,6 +313,7 @@ class MoviesTab(QWidget):
         self.sort_btn.clicked.connect(self.start_sort)
         self.benchmark_btn.clicked.connect(self.open_benchmark)
         self.reload_btn.clicked.connect(self.load_data)
+        self.show_all_btn.clicked.connect(self.clear_search)
         self.header.sectionClicked.connect(self.on_header_clicked)
         self.column_combo.currentIndexChanged.connect(self.update_algorithm_availability)
         self.algo_combo.currentIndexChanged.connect(self.update_algo_info)
@@ -319,6 +343,8 @@ class MoviesTab(QWidget):
         self.all_records = store.load_all()
         store.close()
         self.filter_ids = None
+        self.sample_size = None
+        self.full_order = None
         self.filtered = self.all_records
         self.model.set_records(self.filtered)
         self.last_sorted = None
@@ -340,10 +366,21 @@ class MoviesTab(QWidget):
             self.hint_label.setText(f"The database now has {n:,} movies - click 'Reload data'.")
 
     def update_counts(self):
-        filtered_note = "  (filter active)" if self.filter_ids is not None else ""
+        if self.sample_size is not None:
+            note = f"  (random sample of {self.sample_size:,} rows)"
+        elif self.filter_ids is not None:
+            note = "  (filter active)"
+        else:
+            note = ""
         self.count_label.setText(f"Showing {len(self.filtered):,} of {len(self.all_records):,} "
-                                 f"movies{filtered_note}")
-        self.scope_combo.setItemText(1, f"Filtered results ({len(self.filtered):,} rows)")
+                                 f"movies{note}")
+        filter_active = self.filter_ids is not None
+        self.scope_combo.setItemText(1, f"Sort only filtered rows ({len(self.filtered):,})"
+                                     if filter_active else "Sort only filtered rows")
+        if not filter_active:
+            self.scope_combo.setCurrentIndex(0)          # nothing to choose between
+        self.scope_combo.setEnabled(not self._busy and filter_active)
+        self.show_all_btn.setEnabled(not self._busy and filter_active)
 
     def reset_result_labels(self):
         self.summary_label.setText("No sort run yet. Choose a column and algorithm, then press Sort "
@@ -368,8 +405,38 @@ class MoviesTab(QWidget):
         full = self.scope_combo.currentIndex() == 0 or self.filter_ids is None
         return full, (self.all_records if full else self.filtered)
 
-    def _apply_sorted_records(self, records, scope_full):
-        if scope_full:
+    def _row_limit(self):
+        """How many rows to sort: None means all of them. Raises ValueError for bad input."""
+        text = self.rows_combo.currentText().strip().lower().replace(",", "").replace("rows", "").strip()
+        if text in ("", "all"):
+            return None
+        if not text.isdigit() or int(text) < 1:
+            raise ValueError("Rows must be a whole number of 1 or more, or 'All rows'.")
+        return int(text)
+
+    def _sort_input(self):
+        """(scope_full, rows, sampled) for a sort. If fewer rows than the scope holds were asked
+        for, take a random sample (fixed seed 42: repeatable, and it avoids the bias of 'the first
+        N rows' when the data happens to be sorted already)."""
+        full, pool = self._scope()
+        limit = self._row_limit()
+        if limit is None or limit >= len(pool):
+            return full, pool, False
+        sample = list(pool)
+        random.Random(42).shuffle(sample)
+        return False, sample[:limit], True
+
+    def _scope_text(self, scope_full, sampled):
+        if sampled:
+            return "random sample"
+        return "full dataset" if scope_full else "filtered results"
+
+    def _apply_sorted_records(self, records, scope_full, sampled=False):
+        if sampled:
+            self.filter_ids = {r["id"] for r in records}     # the table now shows just this sample
+            self.sample_size = len(records)
+            self.filtered = records
+        elif scope_full:
             self.all_records = records
             self._rebuild_filtered()        # an active filter stays active, in the new order
         else:
@@ -383,6 +450,15 @@ class MoviesTab(QWidget):
                                      Qt.DescendingOrder if descending else Qt.AscendingOrder)
         self.header.setSortIndicatorShown(True)
         self.last_sorted = (column, descending)
+
+    def _restore_indicator(self):
+        """After a filter / 'Show all rows' the table follows the order of the full dataset,
+        so the header arrow must show that order (or nothing if it was never sorted)."""
+        if self.full_order is not None:
+            self._show_indicator(*self.full_order)
+        else:
+            self.last_sorted = None
+            self.header.setSortIndicatorShown(False)
 
     # ------------------------------------------------------------------
     # sort tab controls
@@ -490,14 +566,18 @@ class MoviesTab(QWidget):
         column = self.column_combo.currentData()
         algorithm = self.algo_combo.currentData()
         descending = self.order_combo.currentIndex() == 1
-        scope_full, data = self._scope()
+        try:
+            scope_full, data, sampled = self._sort_input()
+        except ValueError as error:
+            QMessageBox.warning(self, "Check the number of rows", str(error))
+            return
         if not data:
             QMessageBox.information(self, "Nothing to sort", "There are no movies to sort.")
             return
         if not self._confirm_slow([algorithm], len(data)):
             return
 
-        self._pending = ("sort", column, descending, scope_full)
+        self._pending = ("sort", column, descending, scope_full, sampled)
         self._set_busy(True, f"Sorting {len(data):,} rows with {algorithm}...")
         self.worker = TaskWorker(sort_records, data, column, algorithm, descending)
         self.worker.done.connect(self.on_sort_done)
@@ -505,17 +585,19 @@ class MoviesTab(QWidget):
         self.worker.start()
 
     def on_sort_done(self, result):
-        _, column, descending, scope_full = self._pending
+        _, column, descending, scope_full, sampled = self._pending
         records = result["records"]
-        self._apply_sorted_records(records, scope_full)
+        self._apply_sorted_records(records, scope_full, sampled)
         self._show_indicator(column, descending)
+        if scope_full and not sampled:
+            self.full_order = (column, descending)
 
         name = result["algorithm"]
         info = ALGORITHMS[name]
         self.summary_label.setText(
             f"{name} ({'stable' if info['stable'] else 'unstable'}, average {info['average']}) on "
             f"'{COLUMN_TITLE[column]}', {'descending' if descending else 'ascending'}, "
-            f"{len(records):,} rows ({'full dataset' if scope_full else 'filtered results'})")
+            f"{len(records):,} rows ({self._scope_text(scope_full, sampled)})")
         self.time_label.setText(f"Time: {result['time_ms']:,.2f} ms")
         self.comp_label.setText(f"Comparisons: {result['comparisons']:,}")
         self.swap_label.setText(f"Swaps: {result['swaps']:,}")
@@ -527,13 +609,17 @@ class MoviesTab(QWidget):
     def start_multisort(self, levels):
         if self._busy:
             return
-        scope_full, data = self._scope()
+        try:
+            scope_full, data, sampled = self._sort_input()
+        except ValueError as error:
+            QMessageBox.warning(self, "Check the number of rows", str(error))
+            return
         if not data:
             QMessageBox.information(self, "Nothing to sort", "There are no movies to sort.")
             return
         if not self._confirm_slow([algorithm for _, algorithm, _ in levels], len(data)):
             return
-        self._pending = ("multi", levels, scope_full)
+        self._pending = ("multi", levels, scope_full, sampled)
         self._set_busy(True, f"Multi-level sort of {len(data):,} rows ({len(levels)} levels)...")
         self.worker = TaskWorker(multi_level_sort, data, levels)
         self.worker.done.connect(self.on_multisort_done)
@@ -541,13 +627,15 @@ class MoviesTab(QWidget):
         self.worker.start()
 
     def on_multisort_done(self, result):
-        _, levels, scope_full = self._pending
+        _, levels, scope_full, sampled = self._pending
         records = result["records"]
-        self._apply_sorted_records(records, scope_full)
+        self._apply_sorted_records(records, scope_full, sampled)
         self._show_indicator(levels[0][0], levels[0][2])
+        if scope_full and not sampled:
+            self.full_order = (levels[0][0], levels[0][2])
 
         lines = [f"Multi-level sort, {len(records):,} rows "
-                 f"({'full dataset' if scope_full else 'filtered results'}). "
+                 f"({self._scope_text(scope_full, sampled)}). "
                  f"Passes run from the last level to the first:"]
         for s in result["steps"]:
             lines.append(f"  Level {s['level']}: {COLUMN_TITLE[s['column']]} "
@@ -610,9 +698,11 @@ class MoviesTab(QWidget):
     def _show_filter_result(self, result):
         """Common to single and composite filters: apply the matching ids to the table."""
         self.filter_ids = {r["id"] for r in result["records"]}
+        self.sample_size = None
         self._rebuild_filtered()
         self.model.set_records(self.filtered)
         self.table.scrollToTop()
+        self._restore_indicator()
         self.s_time_label.setText(f"Time: {result['time_ms']:,.3f} ms")
         self.s_comp_label.setText(f"Comparisons: {result['comparisons']:,}")
         self.s_match_label.setText(f"Matches: {result['matches']:,}")
@@ -669,8 +759,10 @@ class MoviesTab(QWidget):
         if self._busy:
             return
         self.filter_ids = None
+        self.sample_size = None
         self._rebuild_filtered()
         self.model.set_records(self.filtered)
+        self._restore_indicator()
         self.value_edit.clear()
         self.value2_edit.clear()
         self.search_summary.setText("Filter cleared.")
@@ -689,7 +781,9 @@ class MoviesTab(QWidget):
     def _set_busy(self, busy, text=""):
         self._busy = busy
         self.tools.setEnabled(not busy)         # disables every tab at once
-        self.scope_combo.setEnabled(not busy)
+        self.scope_combo.setEnabled(not busy and self.filter_ids is not None)
+        self.rows_combo.setEnabled(not busy)
+        self.show_all_btn.setEnabled(not busy and self.filter_ids is not None)
         self.reload_btn.setEnabled(not busy)
         self.progress.setVisible(busy)
         self.hint_label.setText(text if busy else "")
