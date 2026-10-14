@@ -11,7 +11,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Movie Explorer - CS200 Project 1")
-        self.resize(1250, 780)
+        self.resize(1280, 840)
 
         self.movies_tab = MoviesTab()
         self.scraper_tab = ScraperWindow()

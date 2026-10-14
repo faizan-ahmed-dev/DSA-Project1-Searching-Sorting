@@ -517,3 +517,53 @@ def sort_records(records, column, algorithm, descending=False):
         "swaps": stats.swaps,
         "algorithm": algorithm,
     }
+
+
+# =====================================================================
+# MULTI-LEVEL SORTING  (e.g. sort by year, and within each year by rating)
+# =====================================================================
+def multi_level_sort(records, levels):
+    """Sort by several columns. levels = [(column, algorithm, descending), ...] with the
+    MOST important column first, e.g. [("release_year", "Merge Sort", False),
+                                       ("vote_average", "Merge Sort", True)].
+
+    HOW IT WORKS: run one normal sort per level, starting with the LAST (least important)
+    column and finishing with the FIRST (most important) one.
+        pass 1: sort by rating                  (least important)
+        pass 2: sort by year                    (most important)
+    This only works because pass 2 is a STABLE sort: movies with the same year keep the
+    order pass 1 gave them, so within every year they are still sorted by rating.
+    That is why every level except the last one must use a stable algorithm. The last
+    level is sorted first, when there is no earlier order to preserve, so it may use
+    an unstable one (selection, quick, heap, shell).
+
+    Returns a dict: records, time_ms, comparisons, swaps (totals over all passes) and
+    steps (one entry per level, most important first)."""
+    if not levels:
+        raise ValueError("Choose at least one column to sort by.")
+    for number, (column, algorithm, _) in enumerate(levels[:-1], start=1):
+        if algorithm in ALGORITHMS and not ALGORITHMS[algorithm]["stable"]:
+            raise ValueError(f"Level {number} uses {algorithm}, which is unstable. Only the last "
+                             f"level may use an unstable algorithm.")
+
+    current = records
+    steps = []
+    for number in range(len(levels), 0, -1):          # last level first
+        column, algorithm, descending = levels[number - 1]
+        try:
+            result = sort_records(current, column, algorithm, descending)
+        except ValueError as error:
+            raise ValueError(f"Level {number} ({column}): {error}")
+        current = result["records"]
+        steps.append({"level": number, "column": column, "algorithm": algorithm,
+                      "descending": descending, "time_ms": result["time_ms"],
+                      "comparisons": result["comparisons"], "swaps": result["swaps"]})
+    steps.reverse()                                    # show level 1 first
+
+    return {
+        "records": current,
+        "time_ms": sum(s["time_ms"] for s in steps),
+        "comparisons": sum(s["comparisons"] for s in steps),
+        "swaps": sum(s["swaps"] for s in steps),
+        "steps": steps,
+    }

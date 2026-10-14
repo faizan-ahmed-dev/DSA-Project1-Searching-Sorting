@@ -1,8 +1,11 @@
-"""movies_tab.py - the Movies tab: table + sort panel + search panel + result panels.
+"""movies_tab.py - the Movies tab: table + tool tabs + result panels.
 
-All the algorithms live in sorting.py, searching.py and filters.py. This file only
+Tool tabs:  Sort | Multi-level sort | Search / filter | Composite filter (AND / OR / NOT)
+
+All the algorithms live in sorting.py, searching.py, filters.py and composite.py. This
+file only
   * shows the records in a table,
-  * lets the user choose what to sort / search,
+  * collects what the user chose,
   * runs the work in a background thread (bubble sort on 16k rows takes ~25 s, which
     would freeze the window if it ran in the main thread),
   * shows time, comparisons, swaps and match counts afterwards.
@@ -11,19 +14,24 @@ TWO LISTS OF RECORDS
 --------------------
 all_records : the full dataset
 filtered    : what the table shows. Equal to all_records until a search/filter is applied.
-filter_ids  : None (no filter) or the set of movie ids that passed the last search.
+filter_ids  : None (no filter) or the set of movie ids that passed the last search/filter.
               Whenever the full dataset is re-sorted, `filtered` is rebuilt from it, so an
               active filter stays active and in the new order.
+Sort scope (next to the row count) decides whether a sort works on all_records or only
+on the filtered rows.
 """
 from PyQt5.QtCore import QAbstractTableModel, QModelIndex, Qt, QThread, pyqtSignal
 from PyQt5.QtWidgets import (QAbstractItemView, QComboBox, QGridLayout, QGroupBox, QHBoxLayout,
                              QLabel, QLineEdit, QMessageBox, QProgressBar, QPushButton,
-                             QTableView, QVBoxLayout, QWidget)
+                             QTableView, QTabWidget, QVBoxLayout, QWidget)
 
 from benchmark_dialog import BenchmarkDialog
+from composite import evaluate
+from composite_panel import CompositePanel
 from filters import NUMERIC_OPERATORS, TEXT_OPERATORS, filter_records, parse_value
+from multilevel_panel import MultiLevelPanel
 from searching import SEARCH_ALGORITHMS, search_label, search_records
-from sorting import ALGORITHMS, label, sort_records
+from sorting import ALGORITHMS, label, multi_level_sort, sort_records
 from storage import DEFAULT_DB, MovieStore
 
 # (database key, column title, kind, pixel width)   kind: "text", "int" or "float"
@@ -93,7 +101,7 @@ class MovieTableModel(QAbstractTableModel):
 
 
 class TaskWorker(QThread):
-    """Runs one function (a sort or a search) in the background and reports the result."""
+    """Runs one function (a sort, a search...) in the background and reports the result."""
     done = pyqtSignal(object)
     failed = pyqtSignal(str)       # error text (e.g. radix sort on a text column)
 
@@ -126,11 +134,10 @@ class MoviesTab(QWidget):
         self._pending = None
         self.last_sorted = None    # (column key, descending) of the last finished sort
 
-        # ================= sort panel =================
+        # ================= tool tab 1: single-column sort =================
         self.column_combo = QComboBox()
         self.algo_combo = QComboBox()
         self.order_combo = QComboBox()
-        self.scope_combo = QComboBox()
         self.sort_btn = QPushButton("Sort")
         self.benchmark_btn = QPushButton("Benchmark")
         self.algo_info = QLabel()
@@ -142,24 +149,25 @@ class MoviesTab(QWidget):
             self.algo_combo.addItem(label(name), name)
         self.algo_combo.setCurrentIndex(self.algo_combo.findData("Merge Sort"))
         self.order_combo.addItems(["Ascending", "Descending"])
-        self.scope_combo.addItems(["Full dataset", "Filtered results"])
 
-        sort_box = QGroupBox("Sort")
-        grid = QGridLayout(sort_box)
+        sort_page = QWidget()
+        grid = QGridLayout(sort_page)
         grid.addWidget(QLabel("Column:"), 0, 0)
         grid.addWidget(self.column_combo, 0, 1)
         grid.addWidget(QLabel("Order:"), 0, 2)
         grid.addWidget(self.order_combo, 0, 3)
-        grid.addWidget(QLabel("Scope:"), 0, 4)
-        grid.addWidget(self.scope_combo, 0, 5)
+        grid.addWidget(self.sort_btn, 0, 4)
+        grid.addWidget(self.benchmark_btn, 0, 5)
         grid.addWidget(QLabel("Algorithm:"), 1, 0)
-        grid.addWidget(self.algo_combo, 1, 1, 1, 3)
-        grid.addWidget(self.sort_btn, 1, 4)
-        grid.addWidget(self.benchmark_btn, 1, 5)
+        grid.addWidget(self.algo_combo, 1, 1, 1, 5)
         grid.addWidget(self.algo_info, 2, 0, 1, 6)
         grid.setColumnStretch(1, 1)
+        grid.setRowStretch(3, 1)
 
-        # ================= search / filter panel =================
+        # ================= tool tab 2: multi-level sort =================
+        self.multi_panel = MultiLevelPanel(COLUMNS)
+
+        # ================= tool tab 3: single-condition search / filter =================
         self.search_col_combo = QComboBox()
         self.op_combo = QComboBox()
         self.value_edit = QLineEdit()
@@ -180,8 +188,8 @@ class MoviesTab(QWidget):
             self.search_algo_combo.addItem(search_label(name), name)
         self.search_algo_combo.setCurrentIndex(self.search_algo_combo.findData("Binary Search"))
 
-        search_box = QGroupBox("Search / filter")
-        sgrid = QGridLayout(search_box)
+        search_page = QWidget()
+        sgrid = QGridLayout(search_page)
         sgrid.addWidget(QLabel("Column:"), 0, 0)
         sgrid.addWidget(self.search_col_combo, 0, 1)
         sgrid.addWidget(QLabel("Operator:"), 0, 2)
@@ -196,6 +204,16 @@ class MoviesTab(QWidget):
         sgrid.addWidget(self.search_info, 2, 0, 1, 7)
         sgrid.setColumnStretch(1, 1)
         sgrid.setColumnStretch(5, 1)
+        sgrid.setRowStretch(3, 1)
+
+        # ================= tool tab 4: composite filter =================
+        self.composite_panel = CompositePanel(COLUMNS)
+
+        self.tools = QTabWidget()
+        self.tools.addTab(sort_page, "Sort")
+        self.tools.addTab(self.multi_panel, "Multi-level sort")
+        self.tools.addTab(search_page, "Search / filter")
+        self.tools.addTab(self.composite_panel, "Composite filter (AND / OR / NOT)")
 
         # ================= table =================
         self.model = MovieTableModel()
@@ -213,26 +231,25 @@ class MoviesTab(QWidget):
         self.header.setSortIndicatorShown(False)
 
         # ================= result panels =================
-        self.summary_label = QLabel("No sort run yet. Choose a column and algorithm, then press Sort "
-                                    "(or click a column header).")
+        self.summary_label = QLabel()
+        self.summary_label.setWordWrap(True)
         self.time_label = _metric_label()
         self.comp_label = _metric_label()
         self.swap_label = _metric_label()
         sort_result = QGroupBox("Last sort result")
         sv = QVBoxLayout(sort_result)
-        self.summary_label.setWordWrap(True)
         sv.addWidget(self.summary_label)
         sh = QHBoxLayout()
         for lbl in (self.time_label, self.comp_label, self.swap_label):
             sh.addWidget(lbl)
         sv.addLayout(sh)
 
-        self.search_summary = QLabel("No search run yet.")
+        self.search_summary = QLabel()
         self.search_summary.setWordWrap(True)
         self.s_time_label = _metric_label()
         self.s_comp_label = _metric_label()
         self.s_match_label = _metric_label()
-        search_result = QGroupBox("Last search result")
+        search_result = QGroupBox("Last search / filter result")
         rv = QVBoxLayout(search_result)
         rv.addWidget(self.search_summary)
         rh = QHBoxLayout()
@@ -251,15 +268,19 @@ class MoviesTab(QWidget):
         self.count_label = QLabel()
         self.hint_label = QLabel()
         self.hint_label.setStyleSheet("color: #b04000;")
+        self.scope_combo = QComboBox()
+        self.scope_combo.addItems(["Full dataset", "Filtered results"])
+        self.scope_combo.setToolTip("Which rows the sort buttons and the Benchmark work on")
         self.reload_btn = QPushButton("Reload data")
         status = QHBoxLayout()
         status.addWidget(self.count_label)
         status.addWidget(self.hint_label, 1)
+        status.addWidget(QLabel("Sort scope:"))
+        status.addWidget(self.scope_combo)
         status.addWidget(self.reload_btn)
 
         layout = QVBoxLayout(self)
-        layout.addWidget(sort_box)
-        layout.addWidget(search_box)
+        layout.addWidget(self.tools)
         layout.addLayout(status)
         layout.addWidget(self.table, 1)
         layout.addWidget(self.progress)
@@ -272,6 +293,7 @@ class MoviesTab(QWidget):
         self.header.sectionClicked.connect(self.on_header_clicked)
         self.column_combo.currentIndexChanged.connect(self.update_algorithm_availability)
         self.algo_combo.currentIndexChanged.connect(self.update_algo_info)
+        self.multi_panel.sort_requested.connect(self.start_multisort)
         self.search_col_combo.currentIndexChanged.connect(self.update_search_controls)
         self.op_combo.currentIndexChanged.connect(self.update_search_info)
         self.search_algo_combo.currentIndexChanged.connect(self.update_search_info)
@@ -279,6 +301,8 @@ class MoviesTab(QWidget):
         self.value_edit.returnPressed.connect(self.start_search)
         self.value2_edit.returnPressed.connect(self.start_search)
         self.clear_btn.clicked.connect(self.clear_search)
+        self.composite_panel.apply_requested.connect(self.start_composite)
+        self.composite_panel.clear_requested.connect(self.clear_search)
 
         self.update_algorithm_availability()
         self.update_algo_info()
@@ -316,19 +340,21 @@ class MoviesTab(QWidget):
             self.hint_label.setText(f"The database now has {n:,} movies - click 'Reload data'.")
 
     def update_counts(self):
-        filtered_note = "  (search active)" if self.filter_ids is not None else ""
+        filtered_note = "  (filter active)" if self.filter_ids is not None else ""
         self.count_label.setText(f"Showing {len(self.filtered):,} of {len(self.all_records):,} "
                                  f"movies{filtered_note}")
         self.scope_combo.setItemText(1, f"Filtered results ({len(self.filtered):,} rows)")
 
     def reset_result_labels(self):
+        self.summary_label.setText("No sort run yet. Choose a column and algorithm, then press Sort "
+                                   "(or click a column header).")
         self.time_label.setText("Time: -")
         self.comp_label.setText("Comparisons: -")
         self.swap_label.setText("Swaps: -")
+        self.search_summary.setText("No search run yet.")
         self.s_time_label.setText("Time: -")
         self.s_comp_label.setText("Comparisons: -")
         self.s_match_label.setText("Matches: -")
-        self.search_summary.setText("No search run yet.")
 
     def _rebuild_filtered(self):
         """Re-apply the active filter to the (possibly re-sorted) full dataset."""
@@ -338,12 +364,28 @@ class MoviesTab(QWidget):
             self.filtered = [r for r in self.all_records if r["id"] in self.filter_ids]
 
     def _scope(self):
-        """Which rows an action works on. With no active filter, both scopes are the same."""
+        """Which rows a sort works on. With no active filter, both scopes are the same."""
         full = self.scope_combo.currentIndex() == 0 or self.filter_ids is None
         return full, (self.all_records if full else self.filtered)
 
+    def _apply_sorted_records(self, records, scope_full):
+        if scope_full:
+            self.all_records = records
+            self._rebuild_filtered()        # an active filter stays active, in the new order
+        else:
+            self.filtered = records         # only the filtered rows were reordered
+        self.model.set_records(self.filtered)
+        self.table.scrollToTop()
+        self.update_counts()
+
+    def _show_indicator(self, column, descending):
+        self.header.setSortIndicator(self.column_combo.findData(column),
+                                     Qt.DescendingOrder if descending else Qt.AscendingOrder)
+        self.header.setSortIndicatorShown(True)
+        self.last_sorted = (column, descending)
+
     # ------------------------------------------------------------------
-    # sort controls
+    # sort tab controls
     # ------------------------------------------------------------------
     def update_algorithm_availability(self):
         """Counting/radix/bucket sort need numbers (counting/radix: whole numbers),
@@ -374,7 +416,7 @@ class MoviesTab(QWidget):
             f"  |  extra space {info['space']}  |  {'STABLE' if info['stable'] else 'UNSTABLE'}")
 
     # ------------------------------------------------------------------
-    # search controls
+    # search tab controls
     # ------------------------------------------------------------------
     def update_search_controls(self):
         """Operators depend on the column type; interpolation search needs a numeric column."""
@@ -404,7 +446,7 @@ class MoviesTab(QWidget):
         operator = self.op_combo.currentText()
         self.value2_edit.setVisible(operator == "between")
         is_equals = operator == "equals"
-        self.search_algo_combo.setEnabled(is_equals and not self._busy)
+        self.search_algo_combo.setEnabled(is_equals)
         name = self.search_algo_combo.currentData()
         if not is_equals or name is None:
             self.search_info.setText("Filter operators (contains, starts with, greater than, ...) check "
@@ -417,7 +459,7 @@ class MoviesTab(QWidget):
                                  f"worst {info['worst']}  |  {sorted_note}")
 
     # ------------------------------------------------------------------
-    # sorting
+    # single-column sorting
     # ------------------------------------------------------------------
     def on_header_clicked(self, section):
         """Clicking a column header sorts by that column with the chosen algorithm;
@@ -430,6 +472,18 @@ class MoviesTab(QWidget):
         self.order_combo.setCurrentIndex(1 if descending else 0)
         self.start_sort()
 
+    def _confirm_slow(self, algorithms, rows):
+        """Warn before running an O(n²) algorithm on lots of rows. True = go ahead."""
+        slow = [a for a in algorithms if ALGORITHMS[a]["average"] == "O(n²)"]
+        if not slow or rows <= 5000:
+            return True
+        seconds = int(rows ** 2 * 1e-7 * len(slow)) + 1
+        answer = QMessageBox.question(
+            self, "This may take a while",
+            f"{', '.join(slow)} {'is' if len(slow) == 1 else 'are'} O(n²). On {rows:,} rows this can "
+            f"take roughly {seconds} seconds (it cannot be cancelled once started).\n\nContinue?")
+        return answer == QMessageBox.Yes
+
     def start_sort(self):
         if self._busy:
             return
@@ -440,18 +494,10 @@ class MoviesTab(QWidget):
         if not data:
             QMessageBox.information(self, "Nothing to sort", "There are no movies to sort.")
             return
+        if not self._confirm_slow([algorithm], len(data)):
+            return
 
-        info = ALGORITHMS[algorithm]
-        if info["average"] == "O(n²)" and len(data) > 5000:
-            seconds = int(len(data) ** 2 * 1e-7) + 1
-            answer = QMessageBox.question(
-                self, "This may take a while",
-                f"{algorithm} is O(n²). On {len(data):,} rows it can take roughly {seconds} seconds "
-                f"(it cannot be cancelled once started).\n\nContinue?")
-            if answer != QMessageBox.Yes:
-                return
-
-        self._pending = (column, descending, scope_full)
+        self._pending = ("sort", column, descending, scope_full)
         self._set_busy(True, f"Sorting {len(data):,} rows with {algorithm}...")
         self.worker = TaskWorker(sort_records, data, column, algorithm, descending)
         self.worker.done.connect(self.on_sort_done)
@@ -459,31 +505,58 @@ class MoviesTab(QWidget):
         self.worker.start()
 
     def on_sort_done(self, result):
-        column, descending, scope_full = self._pending
+        _, column, descending, scope_full = self._pending
         records = result["records"]
-        if scope_full:
-            self.all_records = records
-            self._rebuild_filtered()        # an active search stays active, in the new order
-        else:
-            self.filtered = records         # only the filtered rows were reordered
-        self.model.set_records(self.filtered)
-        self.last_sorted = (column, descending)
-
-        col_index = self.column_combo.findData(column)
-        self.header.setSortIndicator(col_index, Qt.DescendingOrder if descending else Qt.AscendingOrder)
-        self.header.setSortIndicatorShown(True)
-        self.table.scrollToTop()
+        self._apply_sorted_records(records, scope_full)
+        self._show_indicator(column, descending)
 
         name = result["algorithm"]
         info = ALGORITHMS[name]
         self.summary_label.setText(
             f"{name} ({'stable' if info['stable'] else 'unstable'}, average {info['average']}) on "
-            f"'{COLUMNS[col_index][1]}', {'descending' if descending else 'ascending'}, "
+            f"'{COLUMN_TITLE[column]}', {'descending' if descending else 'ascending'}, "
             f"{len(records):,} rows ({'full dataset' if scope_full else 'filtered results'})")
         self.time_label.setText(f"Time: {result['time_ms']:,.2f} ms")
         self.comp_label.setText(f"Comparisons: {result['comparisons']:,}")
         self.swap_label.setText(f"Swaps: {result['swaps']:,}")
-        self.update_counts()
+        self._set_busy(False)
+
+    # ------------------------------------------------------------------
+    # multi-level sorting
+    # ------------------------------------------------------------------
+    def start_multisort(self, levels):
+        if self._busy:
+            return
+        scope_full, data = self._scope()
+        if not data:
+            QMessageBox.information(self, "Nothing to sort", "There are no movies to sort.")
+            return
+        if not self._confirm_slow([algorithm for _, algorithm, _ in levels], len(data)):
+            return
+        self._pending = ("multi", levels, scope_full)
+        self._set_busy(True, f"Multi-level sort of {len(data):,} rows ({len(levels)} levels)...")
+        self.worker = TaskWorker(multi_level_sort, data, levels)
+        self.worker.done.connect(self.on_multisort_done)
+        self.worker.failed.connect(self.on_task_failed)
+        self.worker.start()
+
+    def on_multisort_done(self, result):
+        _, levels, scope_full = self._pending
+        records = result["records"]
+        self._apply_sorted_records(records, scope_full)
+        self._show_indicator(levels[0][0], levels[0][2])
+
+        lines = [f"Multi-level sort, {len(records):,} rows "
+                 f"({'full dataset' if scope_full else 'filtered results'}). "
+                 f"Passes run from the last level to the first:"]
+        for s in result["steps"]:
+            lines.append(f"  Level {s['level']}: {COLUMN_TITLE[s['column']]} "
+                         f"{'descending' if s['descending'] else 'ascending'} - {s['algorithm']}: "
+                         f"{s['time_ms']:,.1f} ms, {s['comparisons']:,} comparisons, {s['swaps']:,} swaps")
+        self.summary_label.setText("\n".join(lines))
+        self.time_label.setText(f"Total time: {result['time_ms']:,.2f} ms")
+        self.comp_label.setText(f"Comparisons: {result['comparisons']:,}")
+        self.swap_label.setText(f"Swaps: {result['swaps']:,}")
         self._set_busy(False)
 
     # ------------------------------------------------------------------
@@ -502,7 +575,7 @@ class MoviesTab(QWidget):
         dialog.exec_()
 
     # ------------------------------------------------------------------
-    # searching
+    # single-condition search / filter
     # ------------------------------------------------------------------
     def start_search(self):
         if self._busy:
@@ -534,13 +607,19 @@ class MoviesTab(QWidget):
         self.worker.failed.connect(self.on_task_failed)
         self.worker.start()
 
-    def on_search_done(self, result):
-        column, operator, text, text2 = self._pending
+    def _show_filter_result(self, result):
+        """Common to single and composite filters: apply the matching ids to the table."""
         self.filter_ids = {r["id"] for r in result["records"]}
         self._rebuild_filtered()
         self.model.set_records(self.filtered)
         self.table.scrollToTop()
+        self.s_time_label.setText(f"Time: {result['time_ms']:,.3f} ms")
+        self.s_comp_label.setText(f"Comparisons: {result['comparisons']:,}")
+        self.s_match_label.setText(f"Matches: {result['matches']:,}")
+        self.update_counts()
 
+    def on_search_done(self, result):
+        column, operator, text, text2 = self._pending
         condition = f"{COLUMN_TITLE[column]} {operator} '{text}'"
         if operator == "between":
             condition = f"{COLUMN_TITLE[column]} between '{text}' and '{text2}'"
@@ -554,10 +633,36 @@ class MoviesTab(QWidget):
         elif SEARCH_ALGORITHMS.get(result["algorithm"], {}).get("needs_sorted"):
             summary += "  The column was already sorted ascending, so no pre-sort was needed."
         self.search_summary.setText(summary)
-        self.s_time_label.setText(f"Time: {result['time_ms']:,.3f} ms")
-        self.s_comp_label.setText(f"Comparisons: {result['comparisons']:,}")
-        self.s_match_label.setText(f"Matches: {result['matches']:,}")
-        self.update_counts()
+        self._show_filter_result(result)
+        self._set_busy(False)
+
+    # ------------------------------------------------------------------
+    # composite filter (AND / OR / NOT)
+    # ------------------------------------------------------------------
+    def start_composite(self, terms, algorithm):
+        if self._busy:
+            return
+        if not self.all_records:
+            QMessageBox.information(self, "Nothing to filter", "There are no movies to filter.")
+            return
+        self._pending = ("composite",)
+        self._set_busy(True, "Applying composite filter...")
+        self.worker = TaskWorker(evaluate, self.all_records, terms, algorithm, COLUMN_TITLE)
+        self.worker.done.connect(self.on_composite_done)
+        self.worker.failed.connect(self.on_task_failed)
+        self.worker.start()
+
+    def on_composite_done(self, result):
+        lines = [f"Composite filter: {result['expression']}  ->  {result['matches']:,} "
+                 f"match{'es' if result['matches'] != 1 else ''} among {result['rows']:,} rows."]
+        lines += ["  - " + detail for detail in result["details"]]
+        presort = result["presort"]
+        if presort:
+            lines.append(f"  {presort['count']} 'equals' condition(s) needed the column sorted first "
+                         f"({presort['algorithm']}: {presort['time_ms']:,.1f} ms, "
+                         f"{presort['comparisons']:,} comparisons in total) - not included in the time.")
+        self.search_summary.setText("\n".join(lines))
+        self._show_filter_result(result)
         self._set_busy(False)
 
     def clear_search(self):
@@ -568,10 +673,10 @@ class MoviesTab(QWidget):
         self.model.set_records(self.filtered)
         self.value_edit.clear()
         self.value2_edit.clear()
+        self.search_summary.setText("Filter cleared.")
         self.s_time_label.setText("Time: -")
         self.s_comp_label.setText("Comparisons: -")
         self.s_match_label.setText("Matches: -")
-        self.search_summary.setText("Search cleared.")
         self.update_counts()
 
     # ------------------------------------------------------------------
@@ -583,12 +688,9 @@ class MoviesTab(QWidget):
 
     def _set_busy(self, busy, text=""):
         self._busy = busy
-        for widget in (self.column_combo, self.algo_combo, self.order_combo, self.scope_combo,
-                       self.sort_btn, self.benchmark_btn, self.reload_btn, self.search_col_combo,
-                       self.op_combo, self.value_edit, self.value2_edit, self.search_btn,
-                       self.clear_btn):
-            widget.setEnabled(not busy)
-        self.search_algo_combo.setEnabled(not busy and self.op_combo.currentText() == "equals")
+        self.tools.setEnabled(not busy)         # disables every tab at once
+        self.scope_combo.setEnabled(not busy)
+        self.reload_btn.setEnabled(not busy)
         self.progress.setVisible(busy)
         self.hint_label.setText(text if busy else "")
 

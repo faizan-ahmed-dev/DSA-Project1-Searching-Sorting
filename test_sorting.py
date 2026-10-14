@@ -111,7 +111,86 @@ def edge_cases(n_small=2000, n_big=16000):
     print(f"Edge cases: {runs} runs checked, {failures} failures")
 
 
+def multi_level_correctness(n=3000, tries=40):
+    """Random multi-column sorts checked against a full multi-column comparison."""
+    from functools import cmp_to_key
+    from sorting import multi_level_sort
+
+    movies = make_movies(n)
+    kinds = {"title": "text", "original_language": "text", "release_year": "int",
+             "vote_average": "float", "budget": "int"}
+    specs = [
+        [("release_year", False), ("vote_average", True)],
+        [("original_language", False), ("release_year", True), ("title", False)],
+        [("budget", True), ("original_language", False)],
+        [("title", True), ("release_year", False), ("vote_average", False)],
+    ]
+
+    def compatible(name, column):
+        info = ALGORITHMS[name]
+        if info["kind"] == "comparison":
+            return True
+        return kinds[column] != "text" and not (info["integers_only"] and kinds[column] == "float")
+
+    runs = failures = skipped = 0
+    for spec in specs:
+        def cmp_rows(a, b, spec=spec):
+            for column, desc in spec:
+                va, vb = norm_val(a[column]), norm_val(b[column])
+                if va is None and vb is None:
+                    continue
+                if va is None:
+                    return 1                      # empty values always last
+                if vb is None:
+                    return -1
+                if va == vb:
+                    continue
+                smaller = va < vb
+                return (1 if smaller else -1) if desc else (-1 if smaller else 1)
+            return 0
+        expected = sorted(movies, key=cmp_to_key(cmp_rows))      # stable answer key
+
+        for _ in range(tries):
+            levels = []
+            for number, (column, desc) in enumerate(spec):
+                last = number == len(spec) - 1
+                options = [a for a, i in ALGORITHMS.items()
+                           if compatible(a, column) and (last or i["stable"])]
+                levels.append((column, random.choice(options), desc))
+            try:
+                out = multi_level_sort(movies, levels)["records"]
+            except ValueError:
+                skipped += 1                       # e.g. counting sort on a huge range
+                continue
+            all_stable = all(ALGORITHMS[a]["stable"] for _, a, _ in levels)
+            keys = lambda m: tuple(norm_val(m[c]) for c, _ in spec)
+            ok = [keys(m) for m in out] == [keys(m) for m in expected]
+            if all_stable:                         # ties must also keep their original order
+                ok = ok and [m["row"] for m in out] == [m["row"] for m in expected]
+            runs += 1
+            if not ok:
+                failures += 1
+                print(f"FAIL multi-level: {levels}")
+
+    # an unstable algorithm on a NON-last level must be refused
+    refused = False
+    try:
+        multi_level_sort(movies, [("release_year", "Quick Sort", False), ("title", "Merge Sort", False)])
+    except ValueError:
+        refused = True
+    if not refused:
+        failures += 1
+        print("FAIL: unstable algorithm on level 1 was not refused")
+    print(f"Multi-level: {runs} runs checked, {failures} failures, {skipped} skipped "
+          f"(algorithm can't handle that column), unstable-on-level-1 refused: {refused}")
+
+
+def norm_val(v):
+    return v.lower() if isinstance(v, str) else v
+
+
 if __name__ == "__main__":
     correctness()
     edge_cases()
+    multi_level_correctness()
     speed()
