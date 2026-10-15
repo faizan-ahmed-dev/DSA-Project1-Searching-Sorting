@@ -89,6 +89,7 @@ class BenchmarkDialog(QDialog):
         self.size_combo.currentIndexChanged.connect(self.update_estimate)
         self.estimate = QLabel()
         self.start_btn = QPushButton("Run benchmark")
+        self.start_btn.setProperty("accent", True)
         self.cancel_btn = QPushButton("Cancel")
         self.cancel_btn.setEnabled(False)
         self.close_btn = QPushButton("Close")
@@ -133,7 +134,7 @@ class BenchmarkDialog(QDialog):
         seconds = int(size * size * 2e-7) + 1          # bubble + selection + insertion dominate
         self.estimate.setText(f"Estimated time: roughly {seconds} second{'s' if seconds != 1 else ''} "
                               f"(the three O(n²) algorithms take most of it).")
-        self.estimate.setStyleSheet("color: #444;")
+        self.estimate.setProperty("muted", True)
 
     def reset_table(self):
         self.table.clearSpans()

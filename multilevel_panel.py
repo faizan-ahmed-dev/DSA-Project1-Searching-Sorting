@@ -48,13 +48,14 @@ class MultiLevelPanel(QWidget):
         self.order_combos[1].setCurrentIndex(1)
 
         self.run_btn = QPushButton("Multi-level sort")
+        self.run_btn.setProperty("accent", True)
         self.run_btn.clicked.connect(self.run)
         grid.addWidget(self.run_btn, 1, 4)
         self.info = QLabel("The sort runs from the LAST level to the FIRST, one stable pass per level, so "
                            "the order of the later columns survives inside each group of the earlier ones. "
                            "That is why only the last level (sorted first) may use an unstable algorithm.")
         self.info.setWordWrap(True)
-        self.info.setStyleSheet("color: #444;")
+        self.info.setProperty("muted", True)
         grid.addWidget(self.info, 4, 0, 1, 5)
         grid.setColumnStretch(1, 1)
         grid.setColumnStretch(3, 2)

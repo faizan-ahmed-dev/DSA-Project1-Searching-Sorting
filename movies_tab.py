@@ -20,12 +20,16 @@ filter_ids  : None (no filter) or the set of movie ids that passed the last sear
 Sort scope (next to the row count) decides whether a sort works on all_records or only
 on the filtered rows.
 """
+import csv
+import os
 import random
 
-from PyQt5.QtCore import QAbstractTableModel, QModelIndex, Qt, QThread, pyqtSignal
-from PyQt5.QtWidgets import (QAbstractItemView, QComboBox, QGridLayout, QGroupBox, QHBoxLayout,
-                             QLabel, QLineEdit, QMessageBox, QProgressBar, QPushButton,
-                             QTableView, QTabWidget, QVBoxLayout, QWidget)
+from PyQt5.QtCore import QAbstractTableModel, QModelIndex, QSize, Qt, QThread, pyqtSignal
+from PyQt5.QtGui import QBrush, QColor, QFont
+from PyQt5.QtWidgets import (QAbstractItemView, QAction, QComboBox, QFileDialog, QGridLayout,
+                             QGroupBox, QHBoxLayout, QLabel, QLineEdit, QMenu, QMessageBox,
+                             QProgressBar, QPushButton, QSizePolicy, QTableView, QTabWidget,
+                             QVBoxLayout, QWidget)
 
 from benchmark_dialog import BenchmarkDialog
 from composite import evaluate
@@ -35,20 +39,21 @@ from multilevel_panel import MultiLevelPanel
 from searching import SEARCH_ALGORITHMS, search_label, search_records
 from sorting import ALGORITHMS, label, multi_level_sort, sort_records
 from storage import DEFAULT_DB, MovieStore
+from theme import RATING_COLORS
 
 # (database key, column title, kind, pixel width)   kind: "text", "int" or "float"
 COLUMNS = [
-    ("id", "ID", "int", 70),
+    ("id", "ID", "int", 85),
     ("title", "Title", "text", 260),
     ("release_year", "Year", "int", 60),
-    ("release_date", "Release Date", "text", 95),
+    ("release_date", "Release Date", "text", 110),
     ("genres", "Genres", "text", 200),
     ("director", "Director", "text", 160),
-    ("original_language", "Lang", "text", 50),
-    ("runtime", "Runtime", "int", 70),
-    ("vote_average", "Rating", "float", 65),
-    ("vote_count", "Votes", "int", 70),
-    ("popularity", "Popularity", "float", 85),
+    ("original_language", "Lang", "text", 55),
+    ("runtime", "Runtime", "int", 85),
+    ("vote_average", "Rating", "float", 85),
+    ("vote_count", "Votes", "int", 80),
+    ("popularity", "Popularity", "float", 95),
     ("budget", "Budget", "int", 100),
     ("revenue", "Revenue", "int", 110),
 ]
@@ -57,13 +62,39 @@ COLUMN_TITLE = {key: title for key, title, _, _ in COLUMNS}
 THOUSANDS = {"vote_count", "budget", "revenue"}     # shown as 1,234,567
 
 
+def rating_tier(rating, votes):
+    """Which colour band a rating falls in. Movies with no votes have no real rating."""
+    if not votes:
+        return "none"
+    if rating >= 7.5:
+        return "great"
+    if rating >= 6.0:
+        return "good"
+    if rating >= 5.0:
+        return "ok"
+    return "poor"
+
+
 class MovieTableModel(QAbstractTableModel):
     """Tells the QTableView what to show. It does not copy the data: it just
     points at the list of records it is given."""
 
+    RATING_COLUMN = [key for key, _, _, _ in COLUMNS].index("vote_average")
+
     def __init__(self):
         super().__init__()
         self.records = []
+        self.theme = "dark"
+        self.bold = QFont()
+        self.bold.setBold(True)
+
+    def set_theme(self, mode):
+        """Rating colours differ per theme; repaint just the Rating column."""
+        self.theme = mode
+        if self.records:
+            self.dataChanged.emit(self.index(0, self.RATING_COLUMN),
+                                  self.index(len(self.records) - 1, self.RATING_COLUMN),
+                                  [Qt.ForegroundRole])
 
     def set_records(self, records):
         self.beginResetModel()
@@ -92,14 +123,48 @@ class MovieTableModel(QAbstractTableModel):
         if role == Qt.TextAlignmentRole:
             align = Qt.AlignLeft if kind == "text" else Qt.AlignRight
             return int(align | Qt.AlignVCenter)
+        if key == "vote_average" and role in (Qt.ForegroundRole, Qt.FontRole):
+            record = self.records[index.row()]
+            if record.get("vote_average") is None:
+                return None
+            if role == Qt.FontRole:
+                return self.bold
+            tier = rating_tier(record["vote_average"], record.get("vote_count"))
+            return QBrush(QColor(RATING_COLORS[self.theme][tier]))
         return None
 
     def headerData(self, section, orientation, role=Qt.DisplayRole):
+        if (role == Qt.ToolTipRole and orientation == Qt.Horizontal
+                and COLUMNS[section][0] == "vote_average"):
+            return ("Rating colours:  green 7.5 and up  |  amber 6 to 7.5  |  orange 5 to 6  |  "
+                    "red below 5  |  grey = no votes yet")
         if role != Qt.DisplayRole:
             return None
         if orientation == Qt.Horizontal:
             return COLUMNS[section][1]
         return str(section + 1)
+
+
+class FittedTabWidget(QTabWidget):
+    """A tab widget that is only as tall as the tab being shown. (The composite filter tab
+    is taller than the others and would otherwise leave empty space under them.)"""
+
+    def __init__(self):
+        super().__init__()
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)   # never taller than it needs
+        self.currentChanged.connect(lambda _index: self.updateGeometry())
+
+    def _fitted(self, base):
+        page = self.currentWidget()
+        if page is None:
+            return base
+        return QSize(base.width(), page.sizeHint().height() + self.tabBar().sizeHint().height() + 8)
+
+    def sizeHint(self):
+        return self._fitted(super().sizeHint())
+
+    def minimumSizeHint(self):
+        return self._fitted(super().minimumSizeHint())
 
 
 class TaskWorker(QThread):
@@ -143,9 +208,10 @@ class MoviesTab(QWidget):
         self.algo_combo = QComboBox()
         self.order_combo = QComboBox()
         self.sort_btn = QPushButton("Sort")
+        self.sort_btn.setProperty("accent", True)
         self.benchmark_btn = QPushButton("Benchmark")
         self.algo_info = QLabel()
-        self.algo_info.setStyleSheet("color: #444;")
+        self.algo_info.setProperty("muted", True)
 
         for key, title, _, _ in COLUMNS:
             self.column_combo.addItem(title, key)
@@ -181,9 +247,10 @@ class MoviesTab(QWidget):
         self.value2_edit.setVisible(False)
         self.search_algo_combo = QComboBox()
         self.search_btn = QPushButton("Search")
+        self.search_btn.setProperty("accent", True)
         self.clear_btn = QPushButton("Clear search")
         self.search_info = QLabel()
-        self.search_info.setStyleSheet("color: #444;")
+        self.search_info.setProperty("muted", True)
         self.search_info.setWordWrap(True)
 
         for key, title, _, _ in COLUMNS:
@@ -213,7 +280,7 @@ class MoviesTab(QWidget):
         # ================= tool tab 4: composite filter =================
         self.composite_panel = CompositePanel(COLUMNS)
 
-        self.tools = QTabWidget()
+        self.tools = FittedTabWidget()
         self.tools.addTab(sort_page, "Sort")
         self.tools.addTab(self.multi_panel, "Multi-level sort")
         self.tools.addTab(search_page, "Search / filter")
@@ -271,7 +338,7 @@ class MoviesTab(QWidget):
         self.progress.setVisible(False)
         self.count_label = QLabel()
         self.hint_label = QLabel()
-        self.hint_label.setStyleSheet("color: #b04000;")
+        self.hint_label.setProperty("warn", True)
         self.scope_combo = QComboBox()
         self.scope_combo.addItems(["Sort everything", "Sort only filtered rows"])
         self.scope_combo.setToolTip(
@@ -292,6 +359,22 @@ class MoviesTab(QWidget):
         self.show_all_btn = QPushButton("Show all rows")
         self.show_all_btn.setEnabled(False)
         self.reload_btn = QPushButton("Reload data")
+        self.columns_btn = QPushButton("Columns")
+        self.columns_btn.setToolTip("Show or hide table columns")
+        self.columns_menu = QMenu(self.columns_btn)
+        self.column_actions = []
+        for i, (key, title, _, _) in enumerate(COLUMNS):
+            action = QAction(title, self.columns_menu, checkable=True, checked=True)
+            action.toggled.connect(lambda checked, col=i: self.set_column_visible(col, checked))
+            self.columns_menu.addAction(action)
+            self.column_actions.append(action)
+        self.columns_menu.addSeparator()
+        show_all_cols = self.columns_menu.addAction("Show all columns")
+        show_all_cols.triggered.connect(self.show_all_columns)
+        self.columns_btn.setMenu(self.columns_menu)
+        self.export_btn = QPushButton("Export view")
+        self.export_btn.setToolTip("Save exactly what the table shows (current rows, order and visible "
+                                   "columns) as a CSV file")
         status = QHBoxLayout()
         status.addWidget(self.count_label)
         status.addWidget(self.hint_label, 1)
@@ -300,6 +383,8 @@ class MoviesTab(QWidget):
         status.addWidget(QLabel("Rows:"))
         status.addWidget(self.rows_combo)
         status.addWidget(self.show_all_btn)
+        status.addWidget(self.columns_btn)
+        status.addWidget(self.export_btn)
         status.addWidget(self.reload_btn)
 
         layout = QVBoxLayout(self)
@@ -314,6 +399,7 @@ class MoviesTab(QWidget):
         self.benchmark_btn.clicked.connect(self.open_benchmark)
         self.reload_btn.clicked.connect(self.load_data)
         self.show_all_btn.clicked.connect(self.clear_search)
+        self.export_btn.clicked.connect(self.export_view)
         self.header.sectionClicked.connect(self.on_header_clicked)
         self.column_combo.currentIndexChanged.connect(self.update_algorithm_availability)
         self.algo_combo.currentIndexChanged.connect(self.update_algo_info)
@@ -327,6 +413,7 @@ class MoviesTab(QWidget):
         self.clear_btn.clicked.connect(self.clear_search)
         self.composite_panel.apply_requested.connect(self.start_composite)
         self.composite_panel.clear_requested.connect(self.clear_search)
+        self.composite_panel.layout_changed.connect(self.tools.updateGeometry)
 
         self.update_algorithm_availability()
         self.update_algo_info()
@@ -778,6 +865,53 @@ class MoviesTab(QWidget):
         self._set_busy(False)
         QMessageBox.warning(self, "Cannot complete this action", message)
 
+    # ------------------------------------------------------------------
+    # look and table extras
+    # ------------------------------------------------------------------
+    def set_theme(self, mode):
+        self.model.set_theme(mode)
+
+    def set_column_visible(self, column, visible):
+        """Called when a box in the Columns menu is ticked / unticked."""
+        shown = [i for i in range(len(COLUMNS)) if not self.table.isColumnHidden(i)]
+        if not visible and shown == [column]:            # never hide the last visible column
+            self.column_actions[column].blockSignals(True)
+            self.column_actions[column].setChecked(True)
+            self.column_actions[column].blockSignals(False)
+            return
+        self.table.setColumnHidden(column, not visible)
+
+    def show_all_columns(self):
+        for action in self.column_actions:
+            action.setChecked(True)
+
+    def export_view(self):
+        """Save what the table shows (these rows, in this order, visible columns only) to CSV."""
+        if not self.filtered:
+            QMessageBox.information(self, "Nothing to export", "The table is empty.")
+            return
+        start = os.path.join(os.path.dirname(DEFAULT_DB), "movies_view.csv")
+        path, _ = QFileDialog.getSaveFileName(self, "Export current view", start, "CSV files (*.csv)")
+        if not path:
+            return
+        visible = [i for i in range(len(COLUMNS)) if not self.table.isColumnHidden(i)]
+        try:
+            # utf-8-sig so Excel shows accented and non-Latin titles correctly
+            with open(path, "w", newline="", encoding="utf-8-sig") as f:
+                writer = csv.writer(f)
+                writer.writerow([COLUMNS[i][1] for i in visible])
+                for record in self.filtered:
+                    row = []
+                    for i in visible:
+                        value = record.get(COLUMNS[i][0])
+                        row.append("" if value is None else value)
+                    writer.writerow(row)
+        except OSError as error:
+            QMessageBox.warning(self, "Could not save the file", str(error))
+            return
+        QMessageBox.information(self, "Export finished",
+                                f"Saved {len(self.filtered):,} rows and {len(visible)} columns to:\n{path}")
+
     def _set_busy(self, busy, text=""):
         self._busy = busy
         self.tools.setEnabled(not busy)         # disables every tab at once
@@ -785,6 +919,7 @@ class MoviesTab(QWidget):
         self.rows_combo.setEnabled(not busy)
         self.show_all_btn.setEnabled(not busy and self.filter_ids is not None)
         self.reload_btn.setEnabled(not busy)
+        self.export_btn.setEnabled(not busy)
         self.progress.setVisible(busy)
         self.hint_label.setText(text if busy else "")
 

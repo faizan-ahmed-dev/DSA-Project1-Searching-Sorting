@@ -37,6 +37,7 @@ class ConditionRow(QWidget):
         self.value2_edit.setVisible(False)
         self.remove_btn = QPushButton("x")
         self.remove_btn.setFixedWidth(30)
+        self.remove_btn.setProperty("compact", True)
         self.remove_btn.setToolTip("Remove this condition")
 
         layout = QHBoxLayout(self)
@@ -95,6 +96,7 @@ class ConditionRow(QWidget):
 class CompositePanel(QWidget):
     apply_requested = pyqtSignal(list, str)      # terms, algorithm for 'equals' conditions
     clear_requested = pyqtSignal()
+    layout_changed = pyqtSignal()                # a condition row was added or removed
 
     def __init__(self, columns):
         super().__init__()
@@ -111,13 +113,14 @@ class CompositePanel(QWidget):
         self.algo_combo.setToolTip("Used by 'equals' conditions. Interpolation search needs numbers, "
                                    "so text conditions use binary search instead.")
         self.apply_btn = QPushButton("Apply filter")
+        self.apply_btn.setProperty("accent", True)
         self.clear_btn = QPushButton("Clear filter")
         self.preview = QLabel()
         self.preview.setWordWrap(True)
         self.note = QLabel("AND is evaluated before OR (A OR B AND C means A OR (B AND C)). "
                            "NOT also matches movies with an empty value in that column.")
         self.note.setWordWrap(True)
-        self.note.setStyleSheet("color: #444;")
+        self.note.setProperty("muted", True)
 
         buttons = QHBoxLayout()
         buttons.addWidget(self.add_btn)
@@ -163,6 +166,7 @@ class CompositePanel(QWidget):
             row.remove_btn.setEnabled(len(self.rows) > 1)
         self.add_btn.setEnabled(len(self.rows) < MAX_CONDITIONS)
         self.refresh_preview()
+        self.layout_changed.emit()
 
     def refresh_preview(self):
         terms = [row.preview_term() for row in self.rows]
